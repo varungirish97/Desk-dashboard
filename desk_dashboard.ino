@@ -1,4 +1,4 @@
-// Desk dashboard, step 4: clock + weather (Celsius) + touch pages + stocks (Finnhub)
+// Desk dashboard: clock + weather (Celsius) + touch pages + stocks + night mode + OTA updates
 // Board: Guition JC2432W328 (ESP32 Dev Module)
 // Libraries: LovyanGFX, ArduinoJson (v7)
 
@@ -7,11 +7,15 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
+#include <ArduinoOTA.h>
 #include <time.h>
 #include "lgfx_jc2432w328.h"
 #include "secrets.h"
 #ifndef FINNHUB_KEY
 #define FINNHUB_KEY ""
+#endif
+#ifndef OTA_PASSWORD
+#define OTA_PASSWORD ""
 #endif
 
 // ---------------- Settings ----------------
@@ -22,6 +26,16 @@ const unsigned long WEATHER_INTERVAL_MS = 10UL * 60UL * 1000UL;  // every 10 min
 const unsigned long WEATHER_RETRY_MS    = 60UL * 1000UL;         // retry after 1 min on failure
 const unsigned long PAGE_TIMEOUT_MS     = 30UL * 1000UL;         // return to home after 30 s
 const bool DEBUG_TOUCH = false;  // true = draw a dot where you tap and pause 300 ms
+
+// ---------------- Night mode ----------------
+const int NIGHT_START_HOUR = 23;          // 10 PM
+const int NIGHT_END_HOUR   = 7;           // 7 AM
+const int DAY_BRIGHTNESS   = 180;         // 0-255
+const int NIGHT_BRIGHTNESS = 10;
+const unsigned long WAKE_MS = 15UL * 1000UL;  // a tap at night brightens for 15 s
+
+// ---------------- OTA (updates over Wi-Fi) ----------------
+const char* OTA_HOSTNAME = "desk-dashboard";  // reachable as desk-dashboard.local
 
 // ---------------- Stocks ----------------
 const char* TICKERS[] = {"AAPL", "NVDA", "MRVL", "ALAB"};
@@ -67,6 +81,10 @@ bool touchOK = false;
 bool wasPressed = false;
 int lastMinute = -1;
 char lastUpdated[12] = "";
+int currentBrightness = DAY_BRIGHTNESS;
+unsigned long wakeUntil = 0;
+unsigned long lastFade = 0;
+bool otaStarted = false;
 
 struct Quote {
   bool  valid = false;
@@ -105,6 +123,29 @@ const char* weatherText(int c) {
 
 bool haveFinnhubKey() {
   return strlen(FINNHUB_KEY) > 0 && strcmp(FINNHUB_KEY, "your-finnhub-key") != 0;
+}
+
+// ---------------- Night mode ----------------
+bool isNight() {
+  struct tm t;
+  if (!getLocalTime(&t, 0)) return false;
+  int h = t.tm_hour;
+  if (NIGHT_START_HOUR > NIGHT_END_HOUR) return h >= NIGHT_START_HOUR || h < NIGHT_END_HOUR;
+  return h >= NIGHT_START_HOUR && h < NIGHT_END_HOUR;
+}
+
+bool awake() { return (long)(wakeUntil - millis()) > 0; }
+
+// Fade the backlight toward its target a few steps at a time (smooth, non-blocking)
+void updateBrightness() {
+  if (millis() - lastFade < 15) return;
+  lastFade = millis();
+  int target = (isNight() && !awake()) ? NIGHT_BRIGHTNESS : DAY_BRIGHTNESS;
+  if (currentBrightness == target) return;
+  int step = 6;
+  if (target > currentBrightness) currentBrightness = min(target, currentBrightness + step);
+  else                            currentBrightness = max(target, currentBrightness - step);
+  tft.setBrightness(currentBrightness);
 }
 
 // US market hours in Pacific time: Mon-Fri 6:30 AM - 1:00 PM (holidays ignored)
@@ -533,12 +574,40 @@ bool fetchStocks() {
   return any;
 }
 
+// ---------------- OTA ----------------
+void setupOTA() {
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  if (strlen(OTA_PASSWORD) > 0) ArduinoOTA.setPassword(OTA_PASSWORD);
+
+  ArduinoOTA.onStart([]() {
+    wakeUntil = millis() + 10UL * 60UL * 1000UL;
+    currentBrightness = DAY_BRIGHTNESS;
+    tft.setBrightness(DAY_BRIGHTNESS);
+    showMessage("Updating over Wi-Fi...");
+    tft.drawRect(40, 150, 240, 14, COL_DIM);
+    Serial.println("OTA: update started");
+  });
+  ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
+    tft.fillRect(42, 152, (236UL * done) / total, 10, COL_UP);
+  });
+  ArduinoOTA.onEnd([]() {
+    showMessage("Update done, restarting");
+    Serial.println("OTA: done");
+  });
+  ArduinoOTA.onError([](ota_error_t e) {
+    Serial.printf("OTA: error %u\n", e);
+    showPage(page);
+  });
+  ArduinoOTA.begin();
+  Serial.printf("OTA: ready at %s.local (%s)\n", OTA_HOSTNAME, WiFi.localIP().toString().c_str());
+}
+
 // ---------------- Main ----------------
 void setup() {
   Serial.begin(115200);
   tft.init();
   tft.setRotation(1);          // landscape 320x240
-  tft.setBrightness(180);
+  tft.setBrightness(DAY_BRIGHTNESS);
 
   touchOK = touchInit();
   if (!touchOK) {
@@ -571,6 +640,15 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
+  // OTA: start once Wi-Fi is up, then service it every pass
+  if (!otaStarted && WiFi.status() == WL_CONNECTED) {
+    setupOTA();
+    otaStarted = true;
+  }
+  if (otaStarted) ArduinoOTA.handle();
+
+  updateBrightness();
+
   // Touch: poll every 20 ms, act on the press edge (finger down)
   if (touchOK && now - lastTouchPoll >= 20) {
     lastTouchPoll = now;
@@ -583,9 +661,15 @@ void loop() {
         tft.fillCircle(x, y, 8, TFT_MAGENTA);
         delay(300);
       }
-      int next = (x >= 160) ? (page + 1) % PAGE_COUNT
-                            : (page + PAGE_COUNT - 1) % PAGE_COUNT;
-      showPage(next);
+      bool wasDim = isNight() && !awake();
+      if (isNight()) wakeUntil = millis() + WAKE_MS;
+      if (wasDim) {
+        Serial.println("Night mode: wake");        // first tap only brightens the screen
+      } else {
+        int next = (x >= 160) ? (page + 1) % PAGE_COUNT
+                              : (page + PAGE_COUNT - 1) % PAGE_COUNT;
+        showPage(next);
+      }
     }
     wasPressed = pressed;
   }
