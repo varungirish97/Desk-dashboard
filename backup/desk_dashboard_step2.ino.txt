@@ -1,0 +1,342 @@
+// Desk dashboard, step 2: Wi-Fi + internet clock + current weather
+// Board: Guition JC2432W328 (ESP32 Dev Module)
+// Libraries: LovyanGFX, ArduinoJson (v7)
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+#include "lgfx_jc2432w328.h"
+#include "secrets.h"
+
+// ---------------- Settings ----------------
+const float LAT = 37.41f;                       // North San Jose (95134)
+const float LON = -121.95f;
+const char* TZ_INFO = "PST8PDT,M3.2.0,M11.1.0"; // Pacific time with DST rules
+const unsigned long WEATHER_INTERVAL_MS = 10UL * 60UL * 1000UL;  // every 10 min
+const unsigned long WEATHER_RETRY_MS    = 60UL * 1000UL;         // retry after 1 min on failure
+
+// ---------------- Colours (RGB565) ----------------
+const uint16_t COL_BG    = 0x0862;   // deep navy
+const uint16_t COL_CARD  = 0x10E6;   // slightly lighter panel
+const uint16_t COL_TEXT  = TFT_WHITE;
+const uint16_t COL_DIM   = 0x9CF3;   // soft grey
+const uint16_t COL_HIGH  = 0xFD20;   // orange
+const uint16_t COL_LOW   = 0x867D;   // sky blue
+const uint16_t COL_SUN   = 0xFE60;   // warm yellow
+const uint16_t COL_CLOUD = 0xC618;   // light grey
+const uint16_t COL_RAIN  = 0x5D1C;   // blue
+
+LGFX tft;
+
+struct Weather {
+  bool  valid = false;
+  float temp = 0, feels = 0, hi = 0, lo = 0, wind = 0;
+  int   humidity = 0, code = 0;
+  bool  isDay = true;
+} wx;
+
+unsigned long nextWeatherFetch = 0;   // millis() time of next fetch (0 = fetch now)
+int lastMinute = -1;
+char lastUpdated[12] = "";
+
+// ---------------- Helpers ----------------
+const char* weatherText(int c) {
+  switch (c) {
+    case 0:  return "Clear";
+    case 1:  return "Mostly clear";
+    case 2:  return "Partly cloudy";
+    case 3:  return "Overcast";
+    case 45: case 48: return "Fog";
+    case 51: case 53: case 55: return "Drizzle";
+    case 56: case 57: return "Frz. drizzle";
+    case 61: return "Light rain";
+    case 63: return "Rain";
+    case 65: return "Heavy rain";
+    case 66: case 67: return "Frz. rain";
+    case 71: return "Light snow";
+    case 73: return "Snow";
+    case 75: return "Heavy snow";
+    case 77: return "Snow grains";
+    case 80: case 81: return "Showers";
+    case 82: return "Heavy showers";
+    case 85: case 86: return "Snow showers";
+    case 95: return "Thunderstorm";
+    case 96: case 99: return "T-storm, hail";
+    default: return "Unknown";
+  }
+}
+
+void showMessage(const char* msg, uint16_t color = COL_TEXT) {
+  tft.fillScreen(COL_BG);
+  tft.setFont(&fonts::Font4);
+  tft.setTextDatum(middle_center);
+  tft.setTextColor(color, COL_BG);
+  tft.drawString(msg, 160, 120);
+}
+
+// ---------------- Weather icons (drawn with shapes) ----------------
+void drawSun(int cx, int cy, int r) {
+  for (int a = 0; a < 360; a += 45) {
+    float rad = a * DEG_TO_RAD;
+    tft.drawLine(cx + cos(rad) * (r + 4), cy + sin(rad) * (r + 4),
+                 cx + cos(rad) * (r + 10), cy + sin(rad) * (r + 10), COL_SUN);
+  }
+  tft.fillCircle(cx, cy, r, COL_SUN);
+}
+
+void drawMoon(int cx, int cy, int r) {
+  tft.fillCircle(cx, cy, r, COL_CLOUD);
+  tft.fillCircle(cx + r / 2, cy - r / 3, r - 2, COL_CARD);
+}
+
+void drawCloud(int cx, int cy, uint16_t c) {
+  tft.fillCircle(cx - 14, cy + 4, 12, c);
+  tft.fillCircle(cx + 2,  cy - 5, 16, c);
+  tft.fillCircle(cx + 18, cy + 5, 11, c);
+  tft.fillRoundRect(cx - 26, cy + 4, 56, 13, 6, c);
+}
+
+void drawIcon(int code, bool isDay, int cx, int cy) {
+  tft.fillRect(cx - 40, cy - 40, 80, 84, COL_CARD);
+  if (code <= 1) {
+    if (isDay) drawSun(cx, cy, 16); else drawMoon(cx, cy, 18);
+  } else if (code == 2) {
+    if (isDay) drawSun(cx + 10, cy - 12, 12); else drawMoon(cx + 10, cy - 12, 13);
+    drawCloud(cx - 2, cy + 6, COL_CLOUD);
+  } else if (code == 45 || code == 48) {
+    for (int i = 0; i < 4; i++) tft.fillRoundRect(cx - 28 + (i % 2) * 6, cy - 14 + i * 10, 50, 4, 2, COL_CLOUD);
+  } else {
+    drawCloud(cx, cy - 6, COL_CLOUD);
+    bool rain  = (code >= 51 && code <= 67) || (code >= 80 && code <= 82);
+    bool snow  = (code >= 71 && code <= 77) || code == 85 || code == 86;
+    bool storm = code >= 95;
+    if (rain) {
+      for (int i = -1; i <= 1; i++) tft.drawWideLine(cx + i * 14, cy + 18, cx + i * 14 - 5, cy + 30, 2, COL_RAIN);
+    } else if (snow) {
+      for (int i = -1; i <= 1; i++) tft.fillCircle(cx + i * 14, cy + 24, 3, TFT_WHITE);
+    } else if (storm) {
+      tft.fillTriangle(cx + 2, cy + 12, cx - 8, cy + 28, cx + 2, cy + 26, COL_SUN);
+      tft.fillTriangle(cx - 2, cy + 22, cx + 8, cy + 22, cx - 4, cy + 38, COL_SUN);
+    }
+  }
+}
+
+// ---------------- Screen sections ----------------
+void drawStatusBar() {
+  tft.fillRect(0, 0, 320, 22, COL_BG);
+  tft.setFont(&fonts::Font2);
+  tft.setTextDatum(top_left);
+  tft.setTextColor(COL_DIM, COL_BG);
+  tft.drawString("North San Jose", 10, 4);
+
+  tft.setTextDatum(top_right);
+  if (WiFi.status() != WL_CONNECTED) {
+    tft.setTextColor(TFT_RED, COL_BG);
+    tft.drawString("Wi-Fi offline", 310, 4);
+  } else if (!wx.valid) {
+    tft.drawString("Getting weather...", 310, 4);
+  } else {
+    char buf[32];
+    if (lastUpdated[0]) snprintf(buf, sizeof(buf), "Updated %s", lastUpdated);
+    else                snprintf(buf, sizeof(buf), "Weather OK");
+    tft.drawString(buf, 310, 4);
+  }
+}
+
+void drawClock(const struct tm* t) {
+  tft.fillRect(0, 24, 320, 96, COL_BG);
+
+  char hm[8];
+  if (t) {
+    strftime(hm, sizeof(hm), "%I:%M", t);
+  } else {
+    strcpy(hm, "--:--");
+  }
+  const char* hmStr = (hm[0] == '0') ? hm + 1 : hm;   // 09:05 -> 9:05
+
+  tft.setTextDatum(top_left);
+  tft.setTextColor(COL_TEXT, COL_BG);
+  tft.setFont(&fonts::Font7);                          // 7-segment digits
+  tft.drawString(hmStr, 14, 32);
+  int x = 14 + tft.textWidth(hmStr) + 8;
+
+  if (t) {
+    char ampm[4], date[32];
+    strftime(ampm, sizeof(ampm), "%p", t);
+    strftime(date, sizeof(date), "%A, %b ", t);
+    snprintf(date + strlen(date), sizeof(date) - strlen(date), "%d", t->tm_mday);
+
+    tft.setFont(&fonts::Font4);
+    tft.drawString(ampm, x, 34);
+    tft.setTextColor(COL_DIM, COL_BG);
+    tft.drawString(date, 16, 90);
+  } else {
+    tft.setFont(&fonts::Font4);
+    tft.setTextColor(COL_DIM, COL_BG);
+    tft.drawString("Syncing time...", 16, 90);
+  }
+}
+
+void drawWeather() {
+  tft.fillRoundRect(8, 124, 304, 110, 10, COL_CARD);
+  if (!wx.valid) {
+    tft.setFont(&fonts::Font4);
+    tft.setTextDatum(middle_center);
+    tft.setTextColor(COL_DIM, COL_CARD);
+    tft.drawString("Waiting for weather...", 160, 179);
+    return;
+  }
+
+  drawIcon(wx.code, wx.isDay, 54, 176);
+
+  // Big temperature
+  char tbuf[8];
+  snprintf(tbuf, sizeof(tbuf), "%d", (int)roundf(wx.temp));
+  tft.setTextDatum(top_left);
+  tft.setTextColor(COL_TEXT, COL_CARD);
+  tft.setFont(&fonts::FreeSansBold24pt7b);
+  tft.drawString(tbuf, 104, 134);
+  int x = 104 + tft.textWidth(tbuf) + 6;
+  tft.drawCircle(x + 4, 142, 4, COL_TEXT);           // degree symbol
+  tft.drawCircle(x + 4, 142, 3, COL_TEXT);
+  tft.setFont(&fonts::FreeSansBold12pt7b);
+  tft.drawString("F", x + 11, 137);
+
+  // Condition and feels-like
+  tft.setFont(&fonts::FreeSans9pt7b);
+  tft.setTextColor(COL_DIM, COL_CARD);
+  tft.drawString(weatherText(wx.code), 106, 186);
+  char fbuf[24];
+  snprintf(fbuf, sizeof(fbuf), "Feels like %dF", (int)roundf(wx.feels));
+  tft.setFont(&fonts::Font2);
+  tft.drawString(fbuf, 106, 208);
+
+  // Right column: high, low, humidity, wind
+  char buf[20];
+  tft.setFont(&fonts::Font2);
+  tft.setTextColor(COL_HIGH, COL_CARD);
+  snprintf(buf, sizeof(buf), "H %dF", (int)roundf(wx.hi));
+  tft.drawString(buf, 244, 136);
+  tft.setTextColor(COL_LOW, COL_CARD);
+  snprintf(buf, sizeof(buf), "L %dF", (int)roundf(wx.lo));
+  tft.drawString(buf, 244, 158);
+  tft.setTextColor(COL_DIM, COL_CARD);
+  snprintf(buf, sizeof(buf), "%d%% hum", wx.humidity);
+  tft.drawString(buf, 244, 186);
+  snprintf(buf, sizeof(buf), "%d mph", (int)roundf(wx.wind));
+  tft.drawString(buf, 244, 208);
+}
+
+// ---------------- Network ----------------
+bool fetchWeather() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  char url[420];
+  snprintf(url, sizeof(url),
+    "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
+    "&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,is_day"
+    "&daily=temperature_2m_max,temperature_2m_min"
+    "&temperature_unit=fahrenheit&wind_speed_unit=mph"
+    "&timezone=America%%2FLos_Angeles&forecast_days=1",
+    LAT, LON);
+
+  WiFiClientSecure client;
+  client.setInsecure();   // skip certificate check: fine for public weather data
+  HTTPClient http;
+  http.setTimeout(10000);
+  if (!http.begin(client, url)) {
+    Serial.println("Weather: http.begin failed");
+    return false;
+  }
+  int status = http.GET();
+  if (status != HTTP_CODE_OK) {
+    Serial.printf("Weather: HTTP error %d\n", status);
+    http.end();
+    return false;
+  }
+  String body = http.getString();
+  http.end();
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    Serial.printf("Weather: JSON error %s\n", err.c_str());
+    return false;
+  }
+
+  JsonObject cur = doc["current"];
+  wx.temp     = cur["temperature_2m"].as<float>();
+  wx.feels    = cur["apparent_temperature"].as<float>();
+  wx.humidity = cur["relative_humidity_2m"].as<int>();
+  wx.code     = cur["weather_code"].as<int>();
+  wx.wind     = cur["wind_speed_10m"].as<float>();
+  wx.isDay    = cur["is_day"].as<int>() == 1;
+  wx.hi       = doc["daily"]["temperature_2m_max"][0].as<float>();
+  wx.lo       = doc["daily"]["temperature_2m_min"][0].as<float>();
+  wx.valid    = true;
+
+  struct tm t;
+  if (getLocalTime(&t, 0)) {
+    strftime(lastUpdated, sizeof(lastUpdated), "%I:%M %p", &t);
+    if (lastUpdated[0] == '0') memmove(lastUpdated, lastUpdated + 1, strlen(lastUpdated));
+  }
+  Serial.printf("Weather: %.1fF, %s, H %.0f / L %.0f, %d%% hum, %.0f mph\n",
+                wx.temp, weatherText(wx.code), wx.hi, wx.lo, wx.humidity, wx.wind);
+  return true;
+}
+
+// ---------------- Main ----------------
+void setup() {
+  Serial.begin(115200);
+  tft.init();
+  tft.setRotation(1);          // landscape 320x240
+  tft.setBrightness(180);
+
+  showMessage("Connecting to Wi-Fi...");
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) delay(250);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("Wi-Fi connected, IP %s, RSSI %d dBm\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  } else {
+    Serial.println("Wi-Fi failed. Check secrets.h (2.4 GHz networks only).");
+    showMessage("Wi-Fi failed: check secrets.h", TFT_RED);
+    delay(3000);
+  }
+
+  configTzTime(TZ_INFO, "pool.ntp.org", "time.google.com");
+
+  tft.fillScreen(COL_BG);
+  drawStatusBar();
+  drawClock(nullptr);
+  drawWeather();
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // Weather: fire when the timer expires (like a counter-based enable)
+  if ((long)(now - nextWeatherFetch) >= 0) {
+    bool ok = fetchWeather();
+    nextWeatherFetch = now + (ok ? WEATHER_INTERVAL_MS : WEATHER_RETRY_MS);
+    if (ok) drawWeather();
+    drawStatusBar();
+  }
+
+  // Clock: redraw only when the minute changes
+  struct tm t;
+  if (getLocalTime(&t, 0) && t.tm_min != lastMinute) {
+    lastMinute = t.tm_min;
+    drawClock(&t);
+    drawStatusBar();
+  }
+
+  delay(50);
+}
